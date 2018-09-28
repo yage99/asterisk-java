@@ -25,26 +25,31 @@ import static org.asteriskjava.manager.ManagerConnectionState.RECONNECTING;
 
 import java.io.IOException;
 import java.io.Serializable;
-import java.net.Socket;
 import java.net.InetAddress;
+import java.net.Socket;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.asteriskjava.AsteriskVersion;
-import org.asteriskjava.manager.*;
-import org.asteriskjava.manager.action.ChallengeAction;
-import org.asteriskjava.manager.action.CommandAction;
-import org.asteriskjava.manager.action.EventGeneratingAction;
-import org.asteriskjava.manager.action.LoginAction;
-import org.asteriskjava.manager.action.LogoffAction;
-import org.asteriskjava.manager.action.ManagerAction;
+import org.asteriskjava.manager.AuthenticationFailedException;
+import org.asteriskjava.manager.EventTimeoutException;
+import org.asteriskjava.manager.ExpectedResponse;
+import org.asteriskjava.manager.ManagerConnection;
+import org.asteriskjava.manager.ManagerConnectionState;
+import org.asteriskjava.manager.ManagerEventListener;
+import org.asteriskjava.manager.ResponseEvents;
+import org.asteriskjava.manager.SendActionCallback;
+import org.asteriskjava.manager.TimeoutException;
+import org.asteriskjava.manager.action.*;
 import org.asteriskjava.manager.event.ConnectEvent;
 import org.asteriskjava.manager.event.DialBeginEvent;
 import org.asteriskjava.manager.event.DialEvent;
@@ -52,20 +57,16 @@ import org.asteriskjava.manager.event.DisconnectEvent;
 import org.asteriskjava.manager.event.ManagerEvent;
 import org.asteriskjava.manager.event.ProtocolIdentifierReceivedEvent;
 import org.asteriskjava.manager.event.ResponseEvent;
-import org.asteriskjava.manager.response.ChallengeResponse;
-import org.asteriskjava.manager.response.CommandResponse;
-import org.asteriskjava.manager.response.ManagerError;
-import org.asteriskjava.manager.response.ManagerResponse;
+import org.asteriskjava.manager.response.*;
 import org.asteriskjava.util.DateUtil;
 import org.asteriskjava.util.Log;
 import org.asteriskjava.util.LogFactory;
 import org.asteriskjava.util.SocketConnectionFacade;
 import org.asteriskjava.util.internal.SocketConnectionFacadeImpl;
-import org.asteriskjava.manager.action.UserEventAction;
 
 /**
  * Internal implemention of the ManagerConnection interface.
- * 
+ *
  * @author srt
  * @version $Id$
  * @see org.asteriskjava.manager.ManagerConnectionFactory
@@ -78,14 +79,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     private static final int DEFAULT_PORT = 5038;
     private static final int RECONNECTION_VERSION_INTERVAL = 500;
     private static final int MAX_VERSION_ATTEMPTS = 4;
-    private static final Pattern SHOW_VERSION_PATTERN = Pattern.compile("^(core )?show version.*");
-
-    private static final Pattern VERSION_PATTERN_1_6 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?1\\.6[-. ].*");
-    private static final Pattern VERSION_PATTERN_1_8 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?1\\.8[-. ].*");
-    private static final Pattern VERSION_PATTERN_10 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?10[-. ].*");
-    private static final Pattern VERSION_PATTERN_11 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?11[-. ].*");
-    private static final Pattern VERSION_PATTERN_12 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?12[-. ].*");
-    private static final Pattern VERSION_PATTERN_13 = Pattern.compile("^\\s*Asterisk (SVN-branch-)?13[-. ].*");
+    private static final String CMD_SHOW_VERSION = "core show version";
 
     private static final AtomicLong idCounter = new AtomicLong(0);
 
@@ -131,6 +125,11 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     protected String password;
 
     /**
+     * Encoding used for transmission of strings.
+     */
+    private Charset encoding = StandardCharsets.UTF_8;
+
+    /**
      * The default timeout to wait for a ManagerResponse after sending a
      * ManagerAction.
      */
@@ -151,7 +150,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * Closes the connection (and reconnects) if no input has been read for the
      * given amount of milliseconds. A timeout of zero is interpreted as an
      * infinite timeout.
-     * 
+     *
      * @see Socket#setSoTimeout(int)
      */
     private int socketReadTimeout = 0;
@@ -228,9 +227,9 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     public ManagerConnectionImpl()
     {
         this.id = idCounter.getAndIncrement();
-        this.responseListeners = new HashMap<String, SendActionCallback>();
-        this.responseEventListeners = new HashMap<String, ManagerEventListener>();
-        this.eventListeners = new ArrayList<ManagerEventListener>();
+        this.responseListeners = new HashMap<>();
+        this.responseEventListeners = new HashMap<>();
+        this.eventListeners = new ArrayList<>();
         this.protocolIdentifier = new ProtocolIdentifierWrapper();
     }
 
@@ -250,7 +249,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * Sets the hostname of the asterisk server to connect to.
      * <p/>
      * Default is <code>localhost</code>.
-     * 
+     *
      * @param hostname the hostname to connect to
      */
     public void setHostname(String hostname)
@@ -263,7 +262,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * specified in asterisk's <code>manager.conf</code> file.
      * <p/>
      * Default is 5038.
-     * 
+     *
      * @param port the port to connect to
      */
     public void setPort(int port)
@@ -281,7 +280,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * Sets whether to use SSL. <br>
      * Default is false.
-     * 
+     *
      * @param ssl <code>true</code> to use SSL for the connection,
      *            <code>false</code> for a plain text connection.
      * @since 0.3
@@ -294,7 +293,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * Sets the username to use to connect to the asterisk server. This is the
      * username specified in asterisk's <code>manager.conf</code> file.
-     * 
+     *
      * @param username the username to use for login
      */
     public void setUsername(String username)
@@ -305,7 +304,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * Sets the password to use to connect to the asterisk server. This is the
      * password specified in Asterisk's <code>manager.conf</code> file.
-     * 
+     *
      * @param password the password to use for login
      */
     public void setPassword(String password)
@@ -313,12 +312,18 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         this.password = password;
     }
 
+    @Override
+    public void setEncoding(Charset encoding)
+    {
+        this.encoding = encoding;
+    }
+
     /**
      * Sets the time in milliseconds the synchronous method
      * {@link #sendAction(ManagerAction)} will wait for a response before
      * throwing a TimeoutException. <br>
      * Default is 2000.
-     * 
+     *
      * @param defaultResponseTimeout default response timeout in milliseconds
      * @since 0.2
      */
@@ -330,9 +335,10 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * Sets the time in milliseconds the synchronous method
      * {@link #sendEventGeneratingAction(EventGeneratingAction)} will wait for a
-     * response and the last response event before throwing a TimeoutException. <br>
+     * response and the last response event before throwing a TimeoutException.
+     * <br>
      * Default is 5000.
-     * 
+     *
      * @param defaultEventTimeout default event timeout in milliseconds
      * @since 0.2
      */
@@ -345,7 +351,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * Set to <code>true</code> to try reconnecting to ther asterisk serve even
      * if the reconnection attempt threw an AuthenticationFailedException. <br>
      * Default is <code>true</code>.
-     * 
+     *
      * @param keepAliveAfterAuthenticationFailure <code>true</code> to try
      *            reconnecting to ther asterisk serve even if the reconnection
      *            attempt threw an AuthenticationFailedException,
@@ -366,6 +372,12 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     public String getPassword()
     {
         return password;
+    }
+
+    @Override
+    public Charset getEncoding()
+    {
+        return encoding;
     }
 
     public AsteriskVersion getVersion()
@@ -469,6 +481,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * is sent using the calculated key (MD5 hash of the password appended to
      * the received challenge).
      * </ol>
+     *
      * @param timeout the maximum time to wait for the protocol identifier (in
      *            ms)
      * @param eventMask the event mask. Set to "on" if all events should be
@@ -483,8 +496,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * @throws TimeoutException if a timeout occurs while waiting for the
      *             protocol identifier. The connection is closed in this case.
      */
-    protected synchronized void doLogin(long timeout, String eventMask) throws IOException, AuthenticationFailedException,
-            TimeoutException
+    protected synchronized void doLogin(long timeout, String eventMask)
+            throws IOException, AuthenticationFailedException, TimeoutException
     {
         ChallengeAction challengeAction;
         ManagerResponse challengeResponse;
@@ -498,32 +511,26 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
             connect();
         }
 
-        synchronized (protocolIdentifier)
+        if (protocolIdentifier.getValue() == null)
         {
-            if (protocolIdentifier.value == null)
+            try
             {
-                try
-                {
-                    protocolIdentifier.wait(timeout);
-                }
-                catch (InterruptedException e) // NOPMD
-                {
-                    Thread.currentThread().interrupt();
-                }
+                protocolIdentifier.await(timeout);
             }
+            catch (InterruptedException e) // NOPMD
+            {
+                Thread.currentThread().interrupt();
+            }
+        }
 
-            if (protocolIdentifier.value == null)
+        if (protocolIdentifier.getValue() == null)
+        {
+            disconnect();
+            if (reader != null && reader.getTerminationException() != null)
             {
-                disconnect();
-                if (reader != null && reader.getTerminationException() != null)
-                {
-                    throw reader.getTerminationException();
-                }
-                else
-                {
-                    throw new TimeoutException("Timeout waiting for protocol identifier");
-                }
+                throw reader.getTerminationException();
             }
+            throw new TimeoutException("Timeout waiting for protocol identifier");
         }
 
         challengeAction = new ChallengeAction("MD5");
@@ -544,8 +551,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         else
         {
             disconnect();
-            throw new AuthenticationFailedException("Unable to get challenge from Asterisk. ChallengeAction returned: "
-                    + challengeResponse.getMessage());
+            throw new AuthenticationFailedException(
+                    "Unable to get challenge from Asterisk. ChallengeAction returned: " + challengeResponse.getMessage());
         }
 
         try
@@ -555,11 +562,11 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
             md = MessageDigest.getInstance("MD5");
             if (challenge != null)
             {
-                md.update(challenge.getBytes());
+                md.update(challenge.getBytes(StandardCharsets.UTF_8));
             }
             if (password != null)
             {
-                md.update(password.getBytes());
+                md.update(password.getBytes(StandardCharsets.UTF_8));
             }
             key = ManagerUtil.toHexString(md.digest());
         }
@@ -608,132 +615,80 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     {
         int attempts = 0;
 
-        // if ("Asterisk Call Manager/1.1".equals(protocolIdentifier.value))
-        // {
-        // return AsteriskVersion.ASTERISK_1_6;
-        // }
+        logger.info("Got asterisk protocol identifier version " + protocolIdentifier.getValue());
 
         while (attempts++ < MAX_VERSION_ATTEMPTS)
         {
-            final ManagerResponse showVersionFilesResponse;
-            final List<String> showVersionFilesResult;
-
-            // increase timeout as output is quite large
-            showVersionFilesResponse = sendAction(new CommandAction("show version files pbx.c"), defaultResponseTimeout * 2);
-            if (!(showVersionFilesResponse instanceof CommandResponse))
-            {
-                // return early in case of permission problems
-                // org.asteriskjava.manager.response.ManagerError:
-                // actionId='null'; message='Permission denied';
-                // response='Error';
-                // uniqueId='null'; systemHashcode=15231583
-                break;
+            try {
+                AsteriskVersion version = determineVersionByCoreSettings();
+                if (version != null) return version;
+            } catch (Exception e) {
             }
 
-            showVersionFilesResult = ((CommandResponse) showVersionFilesResponse).getResult();
-            if (showVersionFilesResult != null && showVersionFilesResult.size() > 0)
-            {
-                final String line1 = showVersionFilesResult.get(0);
-
-                if (line1 != null && line1.startsWith("File"))
-                {
-                    final String rawVersion;
-
-                    rawVersion = getRawVersion();
-                    if (rawVersion != null && rawVersion.startsWith("Asterisk 1.4"))
-                    {
-                        return AsteriskVersion.ASTERISK_1_4;
-                    }
-                    return AsteriskVersion.ASTERISK_1_2;
-                }
-                else if (line1 != null && line1.contains("No such command"))
-                {
-
-                    final ManagerResponse coreShowVersionResponse = sendAction(new CommandAction("core show version"),
-                            defaultResponseTimeout * 2);
-
-                    if (coreShowVersionResponse != null && coreShowVersionResponse instanceof CommandResponse)
-                    {
-                        final List<String> coreShowVersionResult = ((CommandResponse) coreShowVersionResponse).getResult();
-
-                        if (coreShowVersionResult != null && coreShowVersionResult.size() > 0)
-                        {
-                            final String coreLine = coreShowVersionResult.get(0);
-
-                            if (VERSION_PATTERN_1_6.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_1_6;
-                            }
-                            else if (VERSION_PATTERN_1_8.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_1_8;
-                            }
-                            else if (VERSION_PATTERN_10.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_10;
-                            }
-                            else if (VERSION_PATTERN_11.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_11;
-                            }
-                            else if (VERSION_PATTERN_12.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_12;
-                            }
-                            else if (VERSION_PATTERN_13.matcher(coreLine).matches())
-                            {
-                                return AsteriskVersion.ASTERISK_13;
-                            }
-                        }
-                    }
-
-                    try
-                    {
-                        Thread.sleep(RECONNECTION_VERSION_INTERVAL);
-                    }
-                    catch (Exception ex)
-                    {
-                        // ingnore
-                    } // NOPMD
-                }
-                else
-                {
-                    // if it isn't the "no such command", break and return the
-                    // lowest version immediately
-                    break;
-                }
+            try {
+                AsteriskVersion version = determineVersionByCoreShowVersion();
+                if (version != null) return version;
+            } catch (Exception e) {
             }
+
+            try
+            {
+                Thread.sleep(RECONNECTION_VERSION_INTERVAL);
+            }
+            catch (Exception ex)
+            {
+                // ignore
+            } // NOPMD
         }
 
-        // as a fallback assume 1.6
-        return AsteriskVersion.ASTERISK_1_6;
+        logger.error("Unable to determine asterisk version, assuming " + AsteriskVersion.DEFAULT_VERSION + "... you should expect problems to follow.");
+        return AsteriskVersion.DEFAULT_VERSION;
     }
 
-    protected String getRawVersion()
-    {
-        final ManagerResponse showVersionResponse;
+    /**
+     * Get asterisk version by 'core settings' actions.
+     * This is supported from Asterisk 1.6 onwards.
+     *
+     * @return
+     * @throws Exception
+     */
+    protected AsteriskVersion determineVersionByCoreSettings() throws Exception {
 
-        try
-        {
-            showVersionResponse = sendAction(new CommandAction("show version"), defaultResponseTimeout * 2);
-        }
-        catch (Exception e)
-        {
+        ManagerResponse response = sendAction(new CoreSettingsAction());
+        if (!(response instanceof CoreSettingsResponse)) {
+            // NOTE: you need system or reporting permissions
+            logger.info("Could not get core settings, do we have the necessary permissions?");
             return null;
         }
 
-        if (showVersionResponse instanceof CommandResponse)
-        {
-            final List<String> showVersionResult;
+        String ver = ((CoreSettingsResponse)response).getAsteriskVersion();
+        return AsteriskVersion.getDetermineVersionFromString("Asterisk " + ver);
+    }
 
-            showVersionResult = ((CommandResponse) showVersionResponse).getResult();
-            if (showVersionResult != null && showVersionResult.size() > 0)
-            {
-                return showVersionResult.get(0);
-            }
+    /**
+     * Determine version by the 'core show version' command.
+     * This needs 'command' permissions.
+     *
+     * @return
+     * @throws Exception
+     */
+    protected AsteriskVersion determineVersionByCoreShowVersion() throws Exception {
+        final ManagerResponse coreShowVersionResponse = sendAction(new CommandAction(CMD_SHOW_VERSION));
+
+        if (coreShowVersionResponse == null || !(coreShowVersionResponse instanceof CommandResponse)) {
+            // this needs 'command' permissions
+            logger.info("Could not get response for 'core show version'");
+            return null;
         }
 
-        return null;
+        final List<String> coreShowVersionResult = ((CommandResponse) coreShowVersionResponse).getResult();
+        if (coreShowVersionResult == null || coreShowVersionResult.isEmpty()) {
+            logger.warn("Got empty response for 'core show version'");
+            return null;
+        }
+
+        final String coreLine = coreShowVersionResult.get(0);
+        return AsteriskVersion.getDetermineVersionFromString(coreLine);
     }
 
     protected synchronized void connect() throws IOException
@@ -762,8 +717,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         {
             logger.debug("Creating and starting reader thread");
             readerThread = new Thread(reader);
-            readerThread.setName("Asterisk-Java ManagerConnection-" + id + "-Reader-"
-                    + readerThreadCounter.getAndIncrement());
+            readerThread
+                    .setName("Asterisk-Java ManagerConnection-" + id + "-Reader-" + readerThreadCounter.getAndIncrement());
             readerThread.setDaemon(true);
             readerThread.start();
         }
@@ -774,7 +729,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
     protected SocketConnectionFacade createSocket() throws IOException
     {
-        return new SocketConnectionFacadeImpl(hostname, port, ssl, socketTimeout, socketReadTimeout);
+        return new SocketConnectionFacadeImpl(hostname, port, ssl, socketTimeout, socketReadTimeout, encoding);
     }
 
     public synchronized void logoff() throws IllegalStateException
@@ -820,50 +775,46 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
             }
             socket = null;
         }
-        protocolIdentifier.value = null;
+        protocolIdentifier.reset();
     }
 
-    public ManagerResponse sendAction(ManagerAction action) throws IOException, TimeoutException, IllegalArgumentException,
-            IllegalStateException
+    public ManagerResponse sendAction(ManagerAction action)
+            throws IOException, TimeoutException, IllegalArgumentException, IllegalStateException
     {
         return sendAction(action, defaultResponseTimeout);
     }
 
-    /*
+    /**
      * Implements synchronous sending of "simple" actions.
+     * 
+     * @param timeout - in milliseconds
      */
-    public ManagerResponse sendAction(ManagerAction action, long timeout) throws IOException, TimeoutException,
-            IllegalArgumentException, IllegalStateException
+    public ManagerResponse sendAction(ManagerAction action, long timeout)
+            throws IOException, TimeoutException, IllegalArgumentException, IllegalStateException
     {
-        ResponseHandlerResult result;
-        SendActionCallback callbackHandler;
+        ResponseHandlerResult result = new ResponseHandlerResult();
+        SendActionCallback callbackHandler = new DefaultSendActionCallback(result);
 
-        result = new ResponseHandlerResult();
-        callbackHandler = new DefaultSendActionCallback(result);
+        sendAction(action, callbackHandler);
 
-        synchronized (result)
+        // definitely return null for the response of user events
+        if (action instanceof UserEventAction)
         {
-            sendAction(action, callbackHandler);
+            return null;
+        }
 
-            // definitely return null for the response of user events
-            if (action instanceof UserEventAction)
+        // only wait if we did not yet receive the response.
+        // Responses may be returned really fast.
+        if (result.getResponse() == null)
+        {
+            try
             {
-                return null;
+                result.await(timeout);
             }
-
-            // only wait if we did not yet receive the response.
-            // Responses may be returned really fast.
-            if (result.getResponse() == null)
+            catch (InterruptedException ex)
             {
-                try
-                {
-                    result.wait(timeout);
-                }
-                catch (InterruptedException ex)
-                {
-                    logger.warn("Interrupted while waiting for result");
-                    Thread.currentThread().interrupt();
-                }
+                logger.warn("Interrupted while waiting for result");
+                Thread.currentThread().interrupt();
             }
         }
 
@@ -877,8 +828,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         return result.getResponse();
     }
 
-    public void sendAction(ManagerAction action, SendActionCallback callback) throws IOException, IllegalArgumentException,
-            IllegalStateException
+    public void sendAction(ManagerAction action, SendActionCallback callback)
+            throws IOException, IllegalArgumentException, IllegalStateException
     {
         final String internalActionId;
 
@@ -889,8 +840,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         // In general sending actions is only allowed while connected, though
         // there are a few exceptions, these are handled here:
-        if ((state == CONNECTING || state == RECONNECTING)
-                && (action instanceof ChallengeAction || action instanceof LoginAction || isShowVersionCommandAction(action)))
+        if ((state == CONNECTING || state == RECONNECTING) && (action instanceof ChallengeAction
+                || action instanceof LoginAction || isShowVersionCommandAction(action)))
         {
             // when (re-)connecting challenge and login actions are ok.
         } // NOPMD
@@ -900,8 +851,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         } // NOPMD
         else if (state != CONNECTED)
         {
-            throw new IllegalStateException("Actions may only be sent when in state "
-                    + "CONNECTED, but connection is in state " + state);
+            throw new IllegalStateException(
+                    "Actions may only be sent when in state " + "CONNECTED, but connection is in state " + state);
         }
 
         if (socket == null)
@@ -932,12 +883,15 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
     boolean isShowVersionCommandAction(ManagerAction action)
     {
-        if (!(action instanceof CommandAction))
-        {
-            return false;
+        if (action instanceof CoreSettingsAction)
+            return true;
+
+        if (action instanceof CommandAction) {
+            String cmd = ((CommandAction) action).getCommand();
+            return CMD_SHOW_VERSION.equals(cmd);
         }
-        final Matcher showVersionMatcher = SHOW_VERSION_PATTERN.matcher(((CommandAction) action).getCommand());
-        return showVersionMatcher.matches();
+
+        return false;
     }
 
     private Class< ? extends ManagerResponse> getExpectedResponseClass(Class< ? extends ManagerAction> actionClass)
@@ -951,8 +905,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         return annotation.value();
     }
 
-    public ResponseEvents sendEventGeneratingAction(EventGeneratingAction action) throws IOException, EventTimeoutException,
-            IllegalArgumentException, IllegalStateException
+    public ResponseEvents sendEventGeneratingAction(EventGeneratingAction action)
+            throws IOException, EventTimeoutException, IllegalArgumentException, IllegalStateException
     {
         return sendEventGeneratingAction(action, defaultEventTimeout);
     }
@@ -960,8 +914,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /*
      * Implements synchronous sending of event generating actions.
      */
-    public ResponseEvents sendEventGeneratingAction(EventGeneratingAction action, long timeout) throws IOException,
-            EventTimeoutException, IllegalArgumentException, IllegalStateException
+    public ResponseEvents sendEventGeneratingAction(EventGeneratingAction action, long timeout)
+            throws IOException, EventTimeoutException, IllegalArgumentException, IllegalStateException
     {
         final ResponseEventsImpl responseEvents;
         final ResponseEventHandler responseEventHandler;
@@ -973,20 +927,20 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         }
         else if (action.getActionCompleteEventClass() == null)
         {
-            throw new IllegalArgumentException("Unable to send action: actionCompleteEventClass for "
-                    + action.getClass().getName() + " is null.");
+            throw new IllegalArgumentException(
+                    "Unable to send action: actionCompleteEventClass for " + action.getClass().getName() + " is null.");
         }
         else if (!ResponseEvent.class.isAssignableFrom(action.getActionCompleteEventClass()))
         {
-            throw new IllegalArgumentException("Unable to send action: actionCompleteEventClass ("
-                    + action.getActionCompleteEventClass().getName() + ") for " + action.getClass().getName()
-                    + " is not a ResponseEvent.");
+            throw new IllegalArgumentException(
+                    "Unable to send action: actionCompleteEventClass (" + action.getActionCompleteEventClass().getName()
+                            + ") for " + action.getClass().getName() + " is not a ResponseEvent.");
         }
 
         if (state != CONNECTED)
         {
-            throw new IllegalStateException("Actions may only be sent when in state "
-                    + "CONNECTED but connection is in state " + state);
+            throw new IllegalStateException(
+                    "Actions may only be sent when in state " + "CONNECTED but connection is in state " + state);
         }
 
         responseEvents = new ResponseEventsImpl();
@@ -1008,29 +962,28 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
                 this.responseEventListeners.put(internalActionId, responseEventHandler);
             }
 
-            synchronized (responseEvents)
+            writer.sendAction(action, internalActionId);
+            // only wait if response has not yet arrived.
+            if (responseEvents.getResponse() == null || !responseEvents.isComplete())
             {
-                writer.sendAction(action, internalActionId);
-                // only wait if response has not yet arrived.
-                if ((responseEvents.getResponse() == null || !responseEvents.isComplete()))
+                try
                 {
-                    try
-                    {
-                        responseEvents.wait(timeout);
-                    }
-                    catch (InterruptedException e)
-                    {
-                        logger.warn("Interrupted while waiting for response events.");
-                        Thread.currentThread().interrupt();
-                    }
+                    responseEvents.await(timeout);
+                }
+                catch (InterruptedException e)
+                {
+                    logger.warn("Interrupted while waiting for response events.");
+                    Thread.currentThread().interrupt();
                 }
             }
 
             // still no response or not all events received and timed out?
-            if ((responseEvents.getResponse() == null || !responseEvents.isComplete()))
+            if (responseEvents.getResponse() == null || !responseEvents.isComplete())
             {
-                throw new EventTimeoutException("Timeout waiting for response or response events to " + action.getAction()
-                        + (action.getActionId() == null ? "" : " (actionId: " + action.getActionId() + ")"), responseEvents);
+                throw new EventTimeoutException(
+                        "Timeout waiting for response or response events to " + action.getAction()
+                                + (action.getActionId() == null ? "" : " (actionId: " + action.getActionId() + ")"),
+                        responseEvents);
             }
 
         }
@@ -1058,7 +1011,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * Creates a new unique internal action id based on the hash code of this
      * connection and a sequence.
-     * 
+     *
      * @return a new internal action id
      * @see ManagerUtil#addInternalActionId(String,String)
      * @see ManagerUtil#getInternalActionId(String)
@@ -1066,9 +1019,9 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      */
     private String createInternalActionId()
     {
-        final StringBuffer sb;
+        final StringBuilder sb;
 
-        sb = new StringBuffer();
+        sb = new StringBuilder();
         sb.append(this.hashCode());
         sb.append("_");
         sb.append(actionIdCounter.getAndIncrement());
@@ -1101,7 +1054,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
     public String getProtocolIdentifier()
     {
-        return protocolIdentifier.value;
+        return protocolIdentifier.getValue();
     }
 
     public ManagerConnectionState getState()
@@ -1115,7 +1068,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * This method is called by the reader whenever a {@link ManagerResponse} is
      * received. The response is dispatched to the associated
      * {@link SendActionCallback}.
-     * 
+     *
      * @param response the response received by the reader
      * @see ManagerReader
      */
@@ -1142,7 +1095,10 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
             response.setActionId(ManagerUtil.stripInternalActionId(actionId));
         }
 
-        logger.debug("Dispatching response with internalActionId '" + internalActionId + "':\n" + response);
+        if (logger.isDebugEnabled())
+        {
+            logger.debug("Dispatching response with internalActionId '" + internalActionId + "':\n" + response);
+        }
 
         if (internalActionId != null)
         {
@@ -1163,7 +1119,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         }
         else
         {
-            logger.error("Unable to retrieve internalActionId from response: " + "actionId '" + actionId + "':\n" + response);
+            logger.error(
+                    "Unable to retrieve internalActionId from response: " + "actionId '" + actionId + "':\n" + response);
         }
 
         if (listener != null)
@@ -1182,7 +1139,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     /**
      * This method is called by the reader whenever a ManagerEvent is received.
      * The event is dispatched to all registered ManagerEventHandlers.
-     * 
+     *
      * @param event the event received by the reader
      * @see #addEventListener(ManagerEventListener)
      * @see #removeEventListener(ManagerEventListener)
@@ -1197,7 +1154,10 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
             return;
         }
         dispatchLegacyEventIfNeeded(event);
-        logger.debug("Dispatching event:\n" + event.toString());
+        if (logger.isDebugEnabled())
+        {
+            logger.debug("Dispatching event:\n" + event.toString());
+        }
 
         // Some events need special treatment besides forwarding them to the
         // registered eventListeners (clients)
@@ -1247,36 +1207,40 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         {
             // When we receive get disconnected while we are connected start
             // a new reconnect thread and set the state to RECONNECTING.
-            if (state == CONNECTED)
+            synchronized (this)
             {
-                state = RECONNECTING;
-                // close socket if still open and remove reference to
-                // readerThread
-                // After sending the DisconnectThread that thread will die
-                // anyway.
-                cleanup();
-                Thread reconnectThread = new Thread(new Runnable()
+                if (state == CONNECTED)
                 {
-                    public void run()
+                    state = RECONNECTING;
+                    // close socket if still open and remove reference to
+                    // readerThread
+                    // After sending the DisconnectThread that thread will die
+                    // anyway.
+                    cleanup();
+                    Thread reconnectThread = new Thread(new Runnable()
                     {
-                        reconnect();
-                    }
-                });
-                reconnectThread.setName("Asterisk-Java ManagerConnection-" + id + "-Reconnect-"
-                        + reconnectThreadCounter.getAndIncrement());
-                reconnectThread.setDaemon(true);
-                reconnectThread.start();
-                // now the DisconnectEvent is dispatched to registered
-                // eventListeners
-                // (clients) and after that the ManagerReaderThread is gone.
-                // So effectively we replaced the reader thread by a
-                // ReconnectThread.
-            }
-            else
-            {
-                // when we receive a DisconnectEvent while not connected we
-                // ignore it and do not send it to clients
-                return;
+
+                        public void run()
+                        {
+                            reconnect();
+                        }
+                    });
+                    reconnectThread.setName("Asterisk-Java ManagerConnection-" + id + "-Reconnect-"
+                            + reconnectThreadCounter.getAndIncrement());
+                    reconnectThread.setDaemon(true);
+                    reconnectThread.start();
+                    // now the DisconnectEvent is dispatched to registered
+                    // eventListeners
+                    // (clients) and after that the ManagerReaderThread is gone.
+                    // So effectively we replaced the reader thread by a
+                    // ReconnectThread.
+                }
+                else
+                {
+                    // when we receive a DisconnectEvent while not connected we
+                    // ignore it and do not send it to clients
+                    return;
+                }
             }
         }
         if (event instanceof ProtocolIdentifierReceivedEvent)
@@ -1302,14 +1266,14 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     {
         if (event instanceof DialBeginEvent)
         {
-            DialEvent legacyEvent = (new DialEvent((DialBeginEvent) event));
+            DialEvent legacyEvent = new DialEvent((DialBeginEvent) event);
             dispatchEvent(legacyEvent);
         }
     }
 
     /**
      * Notifies all {@link ManagerEventListener}s registered by users.
-     * 
+     *
      * @param event the event to propagate
      */
     private void fireEvent(ManagerEvent event)
@@ -1334,35 +1298,44 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
      * This method is called when a {@link ProtocolIdentifierReceivedEvent} is
      * received from the reader. Having received a correct protocol identifier
      * is the precodition for logging in.
-     * 
+     *
      * @param identifier the protocol version used by the Asterisk server.
      */
     private void setProtocolIdentifier(final String identifier)
     {
         logger.info("Connected via " + identifier);
 
-        if (!"Asterisk Call Manager/1.0".equals(identifier)
-                && !"Asterisk Call Manager/1.1".equals(identifier) // Asterisk
-                                                                   // 1.6
-                && !"Asterisk Call Manager/1.2".equals(identifier) // bri
-                                                                   // stuffed
-                && !"Asterisk Call Manager/1.3".equals(identifier) // Asterisk
-                                                                   // 11
-                && !"Asterisk Call Manager/2.6.0".equals(identifier) // Asterisk
+        // NOTE: value is AMI_VERSION, defined in include/asterisk/manager.h
+
+        if (!"Asterisk Call Manager/2.6.0".equals(identifier) // Asterisk
                                                                      // 13
                 && !"Asterisk Call Manager/2.7.0".equals(identifier) // Asterisk
                                                                      // 13.2
+                && !"Asterisk Call Manager/2.8.0".equals(identifier) // Asterisk
+                                                                     // > 13.5
+
+                && !"Asterisk Call Manager/2.9.0".equals(identifier) // Asterisk
+                                                                     // > 13.13
+
+                && !"Asterisk Call Manager/3.1.0".equals(identifier) // Asterisk
+                                                                     // =14.3.0
+
+                && !"Asterisk Call Manager/3.2.0".equals(identifier) // since Asterisk 14.4.0
+
+                && !"Asterisk Call Manager/4.0.0".equals(identifier) // since Asterisk 15
+                && !"Asterisk Call Manager/4.0.1".equals(identifier) // since Asterisk 15.1
+                && !"Asterisk Call Manager/4.0.2".equals(identifier) // since Asterisk 15.2
+                && !"Asterisk Call Manager/4.0.3".equals(identifier) // since Asterisk 15.3
+
                 && !"OpenPBX Call Manager/1.0".equals(identifier) && !"CallWeaver Call Manager/1.0".equals(identifier)
                 && !(identifier != null && identifier.startsWith("Asterisk Call Manager Proxy/")))
         {
             logger.warn("Unsupported protocol version '" + identifier + "'. Use at your own risk.");
         }
 
-        synchronized (protocolIdentifier)
-        {
-            protocolIdentifier.value = identifier;
-            protocolIdentifier.notifyAll();
-        }
+        protocolIdentifier.setValue(identifier);
+        protocolIdentifier.countDown();
+
     }
 
     /**
@@ -1382,7 +1355,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         // try to reconnect
         numTries = 0;
-        while (state == RECONNECTING)
+        while (true)
         {
             try
             {
@@ -1406,40 +1379,54 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
             try
             {
-                connect();
+                synchronized (this)
+                {
+                    if (state != RECONNECTING)
+                    {
+                        break;
+                    }
+                    connect();
 
-                try
-                {
-                    doLogin(defaultResponseTimeout, eventMask);
-                    logger.info("Successfully reconnected.");
-                    // everything is ok again, so we leave
-                    // when successful doLogin set the state to CONNECTED so no
-                    // need to adjust it
-                    break;
-                }
-                catch (AuthenticationFailedException e1)
-                {
-                    if (keepAliveAfterAuthenticationFailure)
+                    try
                     {
-                        logger.error("Unable to log in after reconnect: " + e1.getMessage());
+                        doLogin(defaultResponseTimeout, eventMask);
+                        logger.info("Successfully reconnected.");
+                        // everything is ok again, so we leave
+                        // when successful doLogin set the state to CONNECTED so
+                        // no
+                        // need to adjust it
+                        break;
                     }
-                    else
+                    catch (AuthenticationFailedException e1)
                     {
-                        logger.error("Unable to log in after reconnect: " + e1.getMessage() + ". Giving up.");
-                        state = DISCONNECTED;
+                        if (keepAliveAfterAuthenticationFailure)
+                        {
+                            logger.error("Unable to log in after reconnect: " + e1.getMessage());
+                        }
+                        else
+                        {
+                            logger.error("Unable to log in after reconnect: " + e1.getMessage() + ". Giving up.");
+                            state = DISCONNECTED;
+                        }
                     }
-                }
-                catch (TimeoutException e1)
-                {
-                    // shouldn't happen - but happens!
-                    logger.error("TimeoutException while trying to log in " + "after reconnect.");
+                    catch (TimeoutException e1)
+                    {
+                        // shouldn't happen - but happens!
+                        logger.error("TimeoutException while trying to log in " + "after reconnect.");
+                    }
                 }
             }
             catch (IOException e)
             {
                 // server seems to be still down, just continue to attempt
                 // reconnection
-                logger.warn("Exception while trying to reconnect: " + e.getMessage());
+                String message = e.getClass().getSimpleName();
+                if (e.getMessage() != null)
+                {
+                    message = e.getMessage();
+                }
+
+                logger.warn("Exception while trying to reconnect: " + message);
             }
             numTries++;
         }
@@ -1454,9 +1441,9 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
     @Override
     public String toString()
     {
-        StringBuffer sb;
+        StringBuilder sb;
 
-        sb = new StringBuffer("ManagerConnection[");
+        sb = new StringBuilder("ManagerConnection[");
         sb.append("id='").append(id).append("',");
         sb.append("hostname='").append(hostname).append("',");
         sb.append("port=").append(port).append(",");
@@ -1477,6 +1464,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
          */
         private static final long serialVersionUID = 7831097958568769220L;
         private ManagerResponse response;
+        private final CountDownLatch latch = new CountDownLatch(1);
 
         public ResponseHandlerResult()
         {
@@ -1491,6 +1479,21 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
         {
             this.response = response;
         }
+
+        private void countDown()
+        {
+            latch.countDown();
+        }
+
+        /**
+         * @param millis - milliseconds to wait
+         * @throws InterruptedException
+         */
+        private void await(long millis) throws InterruptedException
+        {
+            latch.await(millis, TimeUnit.MILLISECONDS);
+        }
+
     }
 
     /**
@@ -1507,7 +1510,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         /**
          * Creates a new instance.
-         * 
+         *
          * @param result the result to store the response in
          */
         public DefaultSendActionCallback(ResponseHandlerResult result)
@@ -1517,11 +1520,8 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         public void onResponse(ManagerResponse response)
         {
-            synchronized (result)
-            {
-                result.setResponse(response);
-                result.notifyAll();
-            }
+            result.setResponse(response);
+            result.countDown();
         }
     }
 
@@ -1536,7 +1536,7 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         /**
          * Creates a new instance.
-         * 
+         *
          * @param events the ResponseEventsImpl to store the events in
          * @param actionCompleteEventClass the type of event that indicates that
          *            all events have been received
@@ -1549,54 +1549,55 @@ public class ManagerConnectionImpl implements ManagerConnection, Dispatcher
 
         public void onManagerEvent(ManagerEvent event)
         {
-            synchronized (events)
+            // should always be a ResponseEvent, anyway...
+            if (event instanceof ResponseEvent)
             {
-                // should always be a ResponseEvent, anyway...
-                if (event instanceof ResponseEvent)
-                {
-                    ResponseEvent responseEvent;
+                ResponseEvent responseEvent;
 
-                    responseEvent = (ResponseEvent) event;
-                    events.addEvent(responseEvent);
-                }
+                responseEvent = (ResponseEvent) event;
+                events.addEvent(responseEvent);
+            }
 
-                // finished?
-                if (actionCompleteEventClass.isAssignableFrom(event.getClass()))
+            // finished?
+            if (actionCompleteEventClass.isAssignableFrom(event.getClass()))
+            {
+                events.setComplete(true);
+                // notify if action complete event and response have been
+                // received
+                if (events.getResponse() != null)
                 {
-                    events.setComplete(true);
-                    // notify if action complete event and response have been
-                    // received
-                    if (events.getResponse() != null)
-                    {
-                        events.notifyAll();
-                    }
+                    events.countDown();
                 }
             }
         }
 
         public void onResponse(ManagerResponse response)
         {
-            synchronized (events)
+            events.setRepsonse(response);
+            if (response instanceof ManagerError)
             {
-                events.setRepsonse(response);
-                if (response instanceof ManagerError)
-                {
-                    events.setComplete(true);
-                }
+                events.setComplete(true);
+            }
 
-                // finished?
-                // notify if action complete event and response have been
-                // received
-                if (events.isComplete())
-                {
-                    events.notifyAll();
-                }
+            // finished?
+            // notify if action complete event and response have been
+            // received
+            if (events.isComplete())
+            {
+                events.countDown();
             }
         }
     }
 
-    private static class ProtocolIdentifierWrapper
+    @Override
+    public void deregisterEventClass(Class< ? extends ManagerEvent> eventClass)
     {
-        String value;
+        if (reader == null)
+        {
+            reader = createReader(this, this);
+        }
+
+        reader.deregisterEventClass(eventClass);
+
     }
 }
